@@ -4,6 +4,7 @@ import numpy as np
 from fastapi import FastAPI, Body
 from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
+import json
 
 from PIL import Image
 
@@ -214,7 +215,7 @@ def controlnet_api(_: gr.Blocks, app: FastAPI):
             img = HWC3(image["mask"][:, :, 0])
 
         module = global_state.get_module_basename(module)
-        preprocessor = preprocessors.preprocessors[module]
+        preprocessor = cached_cn_preprocessors[module]
 
         if pp:
             pres = external_code.pixel_perfect_resolution(
@@ -229,7 +230,7 @@ def controlnet_api(_: gr.Blocks, app: FastAPI):
                 self.value = ""
 
             def accept(self, json_dict: dict) -> None:
-                self.value = json.dumps(json_dict)
+                self.value = json_dict
 
         json_acceptor = JsonAcceptor()
 
@@ -247,8 +248,15 @@ def controlnet_api(_: gr.Blocks, app: FastAPI):
             result = img
 
         result = external_code.visualize_inpaint_mask(result)
+
+        pose = None
+        if "openpose" in module:
+            assert json_acceptor.value is not None
+            pose = json_acceptor.value
+
         return {
             "image": encode_np_to_base64(result),
+            "pose": pose,
         }
 
     class Person(BaseModel):

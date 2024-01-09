@@ -11,6 +11,7 @@ import gradio as gr
 
 from modules.api.models import *
 from modules.api import api
+from modules import shared
 
 from scripts import external_code, global_state
 from scripts.processor import preprocessor_filters
@@ -18,6 +19,14 @@ from scripts.logging import logger
 from annotator.openpose import draw_poses, decode_json_as_poses
 from annotator.openpose.animalpose import draw_animalposes
 
+from scripts.processor import (
+    preprocessor_sliders_config,
+    no_control_mode_preprocessors,
+    flag_preprocessor_resolution,
+    model_free_preprocessors,
+    preprocessor_filters,
+    HWC3,
+)
 
 def encode_to_base64(image):
     if isinstance(image, str):
@@ -34,6 +43,22 @@ def encode_np_to_base64(image):
     pil = Image.fromarray(image)
     return api.encode_pil_to_base64(pil)
 
+def singleton(cls):
+    instances = {}
+
+    def get_instance(*args, **kwargs):
+        if cls not in instances:
+            instances[cls] = cls(*args, **kwargs)
+        return instances[cls]
+
+    return get_instance
+
+@singleton
+class Preprocessors:
+    def __init__(self):
+        self.preprocessors = global_state.cache_preprocessors(global_state.cn_preprocessor_modules)
+
+preprocessors = Preprocessors()
 
 def controlnet_api(_: gr.Blocks, app: FastAPI):
     @app.get("/controlnet/version")
@@ -151,6 +176,80 @@ def controlnet_api(_: gr.Blocks, app: FastAPI):
             res["poses"] = poses
 
         return res
+
+    @app.post("/controlnet/preprocess")
+    async def preprocess(
+        input_images: dict = Body({}, title="Controlnet Input Images"),
+        module: str = Body("none", title="Controlnet Preprocessor Module"),
+        pres: int = Body(512, title="Controlnet Preprocessor Resolution"),
+        pthr_a: float = Body(-1, title="Controlnet Preprocessor Threshold a"),
+        pthr_b: float = Body(-1, title="Controlnet Preprocessor Threshold b"),
+        wide: int = Body(512, title="Controlnet Target Image Width"),
+        height: int = Body(512, title="Controlnet Target Image Height"),
+        pixel_perfect: bool = Body(False, title="Controlnet Pixel Perfect"),
+        remove_mask: str = Body("Crop and Resize", title="Controlnet Remove Mask"),
+    ):
+        input_images = {
+            "image": external_code.to_base64_nparray(input_images["image"]),
+            "mask": external_code.to_base64_nparray(input_images["mask"]),
+        }
+        return run_annotator(input_images, module, pres, pthr_a, pthr_b, wide, height, pixel_perfect, remove_mask)
+
+    def run_annotator(image, module, pres, pthr_a, pthr_b, t2i_w, t2i_h, pp, rm):
+        if image is None:
+            raise HTTPException(status_code=422, detail="No image selected")
+
+        img = HWC3(image["image"])
+        has_mask = not (
+                (image["mask"][:, :, 0] <= 5).all()
+                or (image["mask"][:, :, 0] >= 250).all()
+        )
+        if "inpaint" in module:
+            color = HWC3(image["image"])
+            alpha = image["mask"][:, :, 0:1]
+            img = np.concatenate([color, alpha], axis=2)
+        elif has_mask and not shared.opts.data.get(
+                "controlnet_ignore_noninpaint_mask", False
+        ):
+            img = HWC3(image["mask"][:, :, 0])
+
+        module = global_state.get_module_basename(module)
+        preprocessor = preprocessors.preprocessors[module]
+
+        if pp:
+            pres = external_code.pixel_perfect_resolution(
+                img,
+                target_H=t2i_h,
+                target_W=t2i_w,
+                resize_mode=external_code.resize_mode_from_value(rm),
+            )
+
+        class JsonAcceptor:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def accept(self, json_dict: dict) -> None:
+                self.value = json.dumps(json_dict)
+
+        json_acceptor = JsonAcceptor()
+
+        result, is_image = preprocessor(
+            img,
+            res=pres,
+            thr_a=pthr_a,
+            thr_b=pthr_b,
+            json_pose_callback=json_acceptor.accept
+            if "openpose" in module
+            else None,
+        )
+
+        if not is_image:
+            result = img
+
+        result = external_code.visualize_inpaint_mask(result)
+        return {
+            "image": encode_np_to_base64(result),
+        }
 
     class Person(BaseModel):
         pose_keypoints_2d: List[float]

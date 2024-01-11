@@ -190,9 +190,15 @@ def controlnet_api(_: gr.Blocks, app: FastAPI):
         pixel_perfect: bool = Body(False, title="Controlnet Pixel Perfect"),
         remove_mask: str = Body("Crop and Resize", title="Controlnet Remove Mask"),
     ):
+        mask = np.zeros((512, 512, 3), dtype=np.uint8)
+        try:
+            mask = external_code.to_base64_nparray(input_images["mask"])
+        except:
+            pass
+
         input_images = {
             "image": external_code.to_base64_nparray(input_images["image"]),
-            "mask": external_code.to_base64_nparray(input_images["mask"]),
+            "mask": mask
         }
         return run_annotator(input_images, module, pres, pthr_a, pthr_b, wide, height, pixel_perfect, remove_mask)
 
@@ -201,6 +207,7 @@ def controlnet_api(_: gr.Blocks, app: FastAPI):
             raise HTTPException(status_code=422, detail="No image selected")
 
         img = HWC3(image["image"])
+        # 如果mask不为空，且不是全黑全白的mask
         has_mask = not (
                 (image["mask"][:, :, 0] <= 5).all()
                 or (image["mask"][:, :, 0] >= 250).all()

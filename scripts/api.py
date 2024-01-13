@@ -195,9 +195,25 @@ def controlnet_api(_: gr.Blocks, app: FastAPI):
             mask = external_code.to_base64_nparray(input_images["mask"])
         except:
             pass
+        import base64
+        import io
+        img_data = base64.b64decode(input_images["image"].split(',', 1)[1])
+        buffered = io.BytesIO(img_data)
+        image = Image.open(buffered)
 
+        # 处理图像的EXIF信息
+        if hasattr(image, '_getexif') and image._getexif() is not None:
+            exif = dict(image._getexif().items())
+            orientation = exif.get(0x0112)
+            if orientation is not None:
+                if orientation == 3:
+                    image = image.transpose(Image.ROTATE_180)
+                elif orientation == 6:
+                    image = image.transpose(Image.ROTATE_270)
+                elif orientation == 8:
+                    image = image.transpose(Image.ROTATE_90)
         input_images = {
-            "image": external_code.to_base64_nparray(input_images["image"]),
+            "image": np.array(image),
             "mask": mask
         }
         return run_annotator(input_images, module, pres, pthr_a, pthr_b, wide, height, pixel_perfect, remove_mask)

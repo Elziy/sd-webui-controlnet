@@ -103,7 +103,8 @@ def controlnet_api(_: gr.Blocks, app: FastAPI):
                     *global_state.select_control_type(control_type)
                 )
                 for control_type in preprocessor_filters.keys()
-            }
+            },
+            "filters": list(preprocessor_filters.keys())
         }
 
     @app.get("/controlnet/settings")

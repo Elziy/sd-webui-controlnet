@@ -1,10 +1,35 @@
 import math
-from typing import List
+from typing import List, NamedTuple, Tuple, Union
 
 import torch
 import torch.nn as nn
+import numpy as np
 from transformers.models.clip.modeling_clip import CLIPVisionModelOutput
 from scripts.logging import logger
+
+
+class ImageEmbed(NamedTuple):
+    """Image embed for a single image."""
+    cond_emb: torch.Tensor
+    uncond_emb: torch.Tensor
+
+    def eval(self, cond_mark: torch.Tensor) -> torch.Tensor:
+        assert cond_mark.ndim == 4
+        assert self.cond_emb.ndim == self.uncond_emb.ndim == 3
+        assert self.cond_emb.shape[0] == self.uncond_emb.shape[0] == 1
+        cond_mark = cond_mark[:, :, :, 0].to(self.cond_emb)
+        device = cond_mark.device
+        dtype = cond_mark.dtype
+        return (
+            self.cond_emb.to(device=device, dtype=dtype) * cond_mark +
+            self.uncond_emb.to(device=device, dtype=dtype) * (1 - cond_mark)
+        )
+
+    def average_of(*args: List[Tuple[torch.Tensor, torch.Tensor]]) -> "ImageEmbed":
+        conds, unconds = zip(*args)
+        def average_tensors(tensors: List[torch.Tensor]) -> torch.Tensor:
+            return torch.sum(torch.stack(tensors), dim=0) / len(tensors)
+        return ImageEmbed(average_tensors(conds), average_tensors(unconds))
 
 
 class MLPProjModel(torch.nn.Module):
@@ -269,7 +294,8 @@ class Resampler(nn.Module):
 
 class IPAdapterModel(torch.nn.Module):
     def __init__(self, state_dict, clip_embeddings_dim, cross_attention_dim,
-                 is_plus, sdxl_plus, is_full, is_faceid: bool, is_portrait: bool):
+                 is_plus, sdxl_plus, is_full, is_faceid: bool, is_portrait: bool,
+                 is_instantid: bool):
         super().__init__()
         self.device = "cpu"
 
@@ -280,7 +306,9 @@ class IPAdapterModel(torch.nn.Module):
         self.is_full = is_full
         self.clip_extra_context_tokens = 16 if (self.is_plus or is_portrait) else 4
 
-        if is_faceid:
+        if is_instantid:
+            self.image_proj_model = self.init_proj_instantid()
+        elif is_faceid:
             self.image_proj_model = self.init_proj_faceid()
         elif self.is_plus:
             if self.is_full:
@@ -326,50 +354,79 @@ class IPAdapterModel(torch.nn.Module):
             )
         return image_proj_model
 
+    def init_proj_instantid(self, image_emb_dim=512, num_tokens=16):
+        image_proj_model = Resampler(
+            dim=1280,
+            depth=4,
+            dim_head=64,
+            heads=20,
+            num_queries=num_tokens,
+            embedding_dim=image_emb_dim,
+            output_dim=self.cross_attention_dim,
+            ff_mult=4,
+        )
+        return image_proj_model
+
     def load_ip_adapter(self, state_dict):
         self.image_proj_model.load_state_dict(state_dict["image_proj"])
         self.ip_layers = To_KV(state_dict["ip_adapter"])
 
     @torch.inference_mode()
-    def get_image_embeds(self, clip_vision_output: CLIPVisionModelOutput):
+    def get_image_embeds(self, clip_vision_output: CLIPVisionModelOutput) -> ImageEmbed:
         self.image_proj_model.cpu()
 
         if self.is_plus:
             from annotator.clipvision import clip_vision_h_uc, clip_vision_vith_uc
             cond = self.image_proj_model(clip_vision_output['hidden_states'][-2].to(device='cpu', dtype=torch.float32))
             uncond = clip_vision_vith_uc.to(cond) if self.sdxl_plus else self.image_proj_model(clip_vision_h_uc.to(cond))
-            return cond, uncond
+            return ImageEmbed(cond, uncond)
 
         clip_image_embeds = clip_vision_output['image_embeds'].to(device='cpu', dtype=torch.float32)
         image_prompt_embeds = self.image_proj_model(clip_image_embeds)
         # input zero vector for unconditional.
         uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds))
-        return image_prompt_embeds, uncond_image_prompt_embeds
+        return ImageEmbed(image_prompt_embeds, uncond_image_prompt_embeds)
 
     @torch.inference_mode()
-    def get_image_embeds_faceid_plus(self, face_embed, clip_vision_output: CLIPVisionModelOutput, is_v2: bool):
+    def get_image_embeds_faceid_plus(
+        self,
+        face_embed: torch.Tensor,
+        clip_vision_output: CLIPVisionModelOutput,
+        is_v2: bool
+    ) -> ImageEmbed:
         face_embed = face_embed.to(self.device, dtype=torch.float32)
         from annotator.clipvision import clip_vision_h_uc
         clip_embed = clip_vision_output['hidden_states'][-2].to(device=self.device, dtype=torch.float32)
-        return (
+        return ImageEmbed(
             self.image_proj_model(face_embed, clip_embed, shortcut=is_v2),
             self.image_proj_model(torch.zeros_like(face_embed), clip_vision_h_uc.to(clip_embed), shortcut=is_v2),
         )
 
     @torch.inference_mode()
-    def get_image_embeds_faceid(self, insightface_outputs: List[torch.Tensor]):
+    def get_image_embeds_faceid(self, insightface_output: torch.Tensor) -> ImageEmbed:
         """Get image embeds for non-plus faceid. Multiple inputs are supported."""
-        batch_size = len(insightface_outputs)
+        self.image_proj_model.to(self.device)
+        faceid_embed = insightface_output.to(self.device, dtype=torch.float32)
+        return ImageEmbed(
+            self.image_proj_model(faceid_embed),
+            self.image_proj_model(torch.zeros_like(faceid_embed)),
+        )
 
-        faceid_embeds = torch.cat(insightface_outputs, dim=0).to(self.device, dtype=torch.float32)
-        assert faceid_embeds.ndim == 2
-        image_prompt_embeds = self.image_proj_model(faceid_embeds)
-        uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(faceid_embeds))
+    @torch.inference_mode()
+    def get_image_embeds_instantid(self, prompt_image_emb: Union[torch.Tensor, np.ndarray]) -> ImageEmbed:
+        """Get image embeds for instantid."""
+        image_proj_model_in_features = 512
+        if isinstance(prompt_image_emb, torch.Tensor):
+            prompt_image_emb = prompt_image_emb.clone().detach()
+        else:
+            prompt_image_emb = torch.tensor(prompt_image_emb)
 
-        c = image_prompt_embeds.size(-1)
-        image_prompt_embeds = image_prompt_embeds.reshape(batch_size, -1, c)
-        uncond_image_prompt_embeds = uncond_image_prompt_embeds.reshape(batch_size, -1, c)
-        return image_prompt_embeds, uncond_image_prompt_embeds
+        prompt_image_emb = prompt_image_emb.to(device=self.device, dtype=torch.float32)
+        prompt_image_emb = prompt_image_emb.reshape([1, -1, image_proj_model_in_features])
+        return ImageEmbed(
+            self.image_proj_model(prompt_image_emb),
+            self.image_proj_model(torch.zeros_like(prompt_image_emb)),
+        )
 
 
 def get_block(model, flag):
@@ -461,6 +518,7 @@ class PlugableIPAdapter(torch.nn.Module):
         super().__init__()
         self.is_v2 = "v2" in model_name
         self.is_faceid = "faceid" in model_name
+        self.is_instantid = "instant_id" in model_name
         self.is_portrait = "portrait" in model_name
         self.is_full = "proj.3.weight" in state_dict['image_proj']
         self.is_plus = (
@@ -474,7 +532,10 @@ class PlugableIPAdapter(torch.nn.Module):
         if self.is_faceid and self.is_v2 and self.is_plus:
             logger.info("IP-Adapter faceid plus v2 detected.")
 
-        if self.is_faceid:
+        if self.is_instantid:
+            # InstantID does not use clip embedding.
+            clip_embeddings_dim = None
+        elif self.is_faceid:
             if self.is_plus:
                 clip_embeddings_dim = 1280
             else:
@@ -497,7 +558,8 @@ class PlugableIPAdapter(torch.nn.Module):
                                         sdxl_plus=self.sdxl_plus,
                                         is_full=self.is_full,
                                         is_faceid=self.is_faceid,
-                                        is_portrait=self.is_portrait)
+                                        is_portrait=self.is_portrait,
+                                        is_instantid=self.is_instantid)
         self.disable_memory_management = True
         self.dtype = None
         self.weight = 1.0
@@ -510,8 +572,24 @@ class PlugableIPAdapter(torch.nn.Module):
         self.cache = {}
         return
 
+    def get_image_emb(self, preprocessor_output) -> ImageEmbed:
+        if self.is_instantid:
+            return self.ipadapter.get_image_embeds_instantid(preprocessor_output)
+        elif self.is_faceid and self.is_plus:
+            # Note: FaceID plus uses both face_embed and clip_embed.
+            # This should be the return value from preprocessor.
+            return self.ipadapter.get_image_embeds_faceid_plus(
+                preprocessor_output.face_embed,
+                preprocessor_output.clip_embed,
+                is_v2=self.is_v2
+            )
+        elif self.is_faceid:
+            return self.ipadapter.get_image_embeds_faceid(preprocessor_output)
+        else:
+            return self.ipadapter.get_image_embeds(preprocessor_output)
+
     @torch.no_grad()
-    def hook(self, model, clip_vision_output, weight, start, end, dtype=torch.float32):
+    def hook(self, model, preprocessor_outputs, weight, start, end, dtype=torch.float32):
         global current_model
         current_model = model
 
@@ -525,21 +603,11 @@ class PlugableIPAdapter(torch.nn.Module):
         self.dtype = dtype
 
         self.ipadapter.to(device, dtype=self.dtype)
-        if self.is_faceid and self.is_plus:
-            # Note: FaceID plus uses both face_embed and clip_embed.
-            # This should be the return value from preprocessor.
-            assert isinstance(clip_vision_output, (list, tuple))
-            assert len(clip_vision_output) == 2
-            self.image_emb, self.uncond_image_emb = self.ipadapter.get_image_embeds_faceid_plus(*clip_vision_output, is_v2=self.is_v2)
-        elif self.is_faceid:
-            assert isinstance(clip_vision_output, (list, tuple))
-            self.image_emb, self.uncond_image_emb = self.ipadapter.get_image_embeds_faceid(clip_vision_output)
+        if isinstance(preprocessor_outputs, (list, tuple)):
+            preprocessor_outputs = preprocessor_outputs
         else:
-            self.image_emb, self.uncond_image_emb = self.ipadapter.get_image_embeds(clip_vision_output)
-
-        self.image_emb = self.image_emb.to(device, dtype=self.dtype)
-        self.uncond_image_emb = self.uncond_image_emb.to(device, dtype=self.dtype)
-
+            preprocessor_outputs = [preprocessor_outputs]
+        self.image_emb = ImageEmbed.average_of(*[self.get_image_emb(o) for o in preprocessor_outputs])
         # From https://github.com/laksjdjf/IPAdapter-ComfyUI
         if not self.sdxl:
             number = 0  # index of to_kvs
@@ -588,10 +656,9 @@ class PlugableIPAdapter(torch.nn.Module):
             if current_sampling_percent < self.p_start or current_sampling_percent > self.p_end:
                 return 0
 
-            cond_mark = current_model.cond_mark[:, :, :, 0].to(self.image_emb)
-            cond_uncond_image_emb = self.image_emb * cond_mark + self.uncond_image_emb * (1 - cond_mark)
             k_key = f"{number * 2 + 1}_to_k_ip"
             v_key = f"{number * 2 + 1}_to_v_ip"
+            cond_uncond_image_emb = self.image_emb.eval(current_model.cond_mark)
             ip_k = self.call_ip(k_key, cond_uncond_image_emb, device=q.device)
             ip_v = self.call_ip(v_key, cond_uncond_image_emb, device=q.device)
 
